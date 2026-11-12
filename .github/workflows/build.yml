@@ -2,7 +2,7 @@ name: Build, Release
 
 on:
   push:
-    branches: [ test ]
+    branches: [ test, conpty-stubs ]
     tags:
       - '*'
   pull_request:
@@ -158,6 +158,25 @@ jobs:
 
           echo "out_file_debug=$out_name_debug" >> "$GITHUB_OUTPUT"
           echo "out_file_release=$out_name_release" >> "$GITHUB_OUTPUT"
+
+      - name: Extract patched x64 KxBase.dll
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $sfx = Get-ChildItem KexSetup_Release_*.exe | Select-Object -First 1
+          if (-not $sfx) { throw "KexSetup_Release exe not found" }
+          7z x $sfx.FullName -oKxBaseOut -y
+          if (Test-Path "KxBaseOut\Archive.7z") { 7z x "KxBaseOut\Archive.7z" -oKxBaseOut -y }
+          if (-not (Test-Path "KxBaseOut\Kex64\KxBase.dll")) { throw "KxBase.dll not found in installer" }
+
+      - name: Upload patched x64 KxBase.dll
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: KxBase-x64-conpty-stubs
+          path: KxBaseOut/Kex64/KxBase.dll
+          archive: false
+          if-no-files-found: warn
 
       - name: Upload Debug Artifact
         uses: actions/upload-artifact@v7
