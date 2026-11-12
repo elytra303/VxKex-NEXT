@@ -867,6 +867,8 @@ KXBASEAPI BOOL WINAPI Ext_SetDefaultDllDirectories(
 // console.c
 //
 
+typedef HANDLE TYPEDEF_TYPE_NAME(HPCON);
+
 KXBASEAPI BOOL WINAPI Ext_WriteConsoleA(
 	IN	HANDLE	ConsoleHandle,
 	IN	PCVOID	Buffer,
@@ -880,5 +882,19 @@ KXBASEAPI BOOL WINAPI Ext_WriteConsoleW(
 	IN	ULONG	CchToWrite,
 	OUT	PULONG	CchWritten OPTIONAL,
 	IN	PVOID	Reserved OPTIONAL);
+
+KXBASEAPI HRESULT WINAPI Ext_CreatePseudoConsole(
+	IN	COORD	Size,
+	IN	HANDLE	InputHandle,
+	IN	HANDLE	OutputHandle,
+	IN	ULONG	Flags,
+	OUT	HPCON	*PseudoConsole);
+
+KXBASEAPI HRESULT WINAPI Ext_ResizePseudoConsole(
+	IN	HPCON	PseudoConsole,
+	IN	COORD	Size);
+
+KXBASEAPI VOID WINAPI Ext_ClosePseudoConsole(
+	IN	HPCON	PseudoConsole);
 
 #endif // if defined(KEX_ENV_WIN32)
