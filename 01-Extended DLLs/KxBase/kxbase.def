@@ -234,3 +234,8 @@ EXPORTS
 	GetConsoleTitleW						= Ext_GetConsoleTitleW
 	GetConsoleOriginalTitleA				= Ext_GetConsoleOriginalTitleA
 	GetConsoleOriginalTitleW				= Ext_GetConsoleOriginalTitleW
+	CreatePseudoConsole						= Ext_CreatePseudoConsole
+	ResizePseudoConsole						= Ext_ResizePseudoConsole
+	ClosePseudoConsole						= Ext_ClosePseudoConsole
+	ReadConsoleInputA						= Ext_ReadConsoleInputA
+	ReadConsoleInputW						= Ext_ReadConsoleInputW

@@ -145,6 +145,24 @@ BOOL IsConsoleHandle(
 BOOLEAN IsConsoleOutputHandle(
 	IN	HANDLE	Handle);
 
+BOOLEAN IsConsoleInputHandle(
+	IN	HANDLE	Handle);
+
+BOOLEAN BaseIsMouseTrackingEnabled(
+	VOID);
+
+BOOLEAN BaseIsConsoleInputTranslationNeeded(
+	VOID);
+
+BOOLEAN BaseTranslateMouseEvent(
+	IN	PMOUSE_EVENT_RECORD	MouseEvent,
+	OUT	PWCHAR				Buffer,
+	IN	ULONG				BufferCch,
+	OUT	PULONG				CchOut);
+
+VOID BaseDisableConsoleMouseInput(
+	VOID);
+
 BOOLEAN BaseIsConsoleAnsiSupportEnabled(
 	IN	HANDLE	ConsoleHandle);
 

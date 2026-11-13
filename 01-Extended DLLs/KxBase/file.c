@@ -321,11 +321,13 @@ KXBASEAPI BOOL WINAPI Ext_WriteFile(
 {
 	ULONG DummyNumberOfBytesWritten;
 
-	if (IsConsoleHandle(FileHandle) && BaseIsConsoleAnsiSupportEnabled(FileHandle)) {
+	if (IsConsoleHandle(FileHandle)) {
 		//
-		// In order to support ANSI escape sequences, we need to redirect
-		// WriteFile to Ext_WriteConsoleA if we're writing to a console and the
-		// ANSI escape sequence processing is enabled.
+		// Route console writes through Ext_WriteConsoleA. Besides supporting
+		// ANSI escape sequences when the application has enabled them, this
+		// lets Ext_WriteConsoleA turn on ANSI processing automatically when it
+		// sees an escape sequence, even if the application never called
+		// SetConsoleMode.
 		//
 
 		return Ext_WriteConsoleA(

@@ -37,6 +37,35 @@
 #include "kxbasep.h"
 
 #define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x4
+#define ENABLE_VIRTUAL_TERMINAL_INPUT		0x200
+
+STATIC BOOLEAN BufferContainsEscape(
+	IN	PCVOID	Buffer,
+	IN	ULONG	Cch,
+	IN	BOOLEAN	Unicode)
+{
+	ULONG Index;
+
+	if (!Buffer || !Cch) {
+		return FALSE;
+	}
+
+	if (Unicode) {
+		for (Index = 0; Index < Cch; ++Index) {
+			if (((PCWCHAR) Buffer)[Index] == L'\x1B') {
+				return TRUE;
+			}
+		}
+	} else {
+		for (Index = 0; Index < Cch; ++Index) {
+			if (((PCSTR) Buffer)[Index] == 0x1B) {
+				return TRUE;
+			}
+		}
+	}
+
+	return FALSE;
+}
 
 KXBASEAPI BOOL WINAPI Ext_WriteConsoleA(
 	IN	HANDLE	ConsoleHandle,
@@ -45,6 +74,13 @@ KXBASEAPI BOOL WINAPI Ext_WriteConsoleA(
 	OUT	PULONG	CchWritten OPTIONAL,
 	IN	PVOID	Reserved OPTIONAL)
 {
+	if (!BaseIsConsoleAnsiSupportEnabled(ConsoleHandle) &&
+		IsConsoleOutputHandle(ConsoleHandle) &&
+		BufferContainsEscape(Buffer, CchToWrite, FALSE)) {
+
+		BaseEnableConsoleAnsiSupport(ConsoleHandle);
+	}
+
 	if (BaseIsConsoleAnsiSupportEnabled(ConsoleHandle)) {
 		return WriteConsoleWithEscapeSequencesAorW(
 			ConsoleHandle,
@@ -70,6 +106,13 @@ KXBASEAPI BOOL WINAPI Ext_WriteConsoleW(
 	OUT	PULONG	CchWritten OPTIONAL,
 	IN	PVOID	Reserved OPTIONAL)
 {
+	if (!BaseIsConsoleAnsiSupportEnabled(ConsoleHandle) &&
+		IsConsoleOutputHandle(ConsoleHandle) &&
+		BufferContainsEscape(Buffer, CchToWrite, TRUE)) {
+
+		BaseEnableConsoleAnsiSupport(ConsoleHandle);
+	}
+
 	if (BaseIsConsoleAnsiSupportEnabled(ConsoleHandle)) {
 		return WriteConsoleWithEscapeSequencesAorW(
 			ConsoleHandle,
@@ -98,9 +141,14 @@ KXBASEAPI BOOL WINAPI Ext_GetConsoleMode(
 
 	if (Success) {
 		if (IsConsoleOutputHandle(ConsoleHandle)) {
-			if (BaseIsConsoleAnsiSupportEnabled(ConsoleHandle)) {
-				*Mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-			}
+			*Mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+		} else if (ConsoleHandle == GetStdHandle(STD_INPUT_HANDLE)) {
+			//
+			// Hide the flags which we set on the application's behalf while
+			// mouse reporting is active.
+			//
+
+			*Mode &= ~ENABLE_MOUSE_INPUT;
 		}
 	}
 
@@ -126,6 +174,20 @@ KXBASEAPI BOOL WINAPI Ext_SetConsoleMode(
 		} else {
 			DisableAnsiOutput = TRUE;
 		}
+	} else {
+		//
+		// Windows 7 has no virtual terminal input mode. Drop the flag instead of
+		// failing the whole call, so that applications which request raw VT
+		// input at least keep their console modes. Mouse reporting is
+		// synthesized by conansi.c and does not require this flag.
+		//
+
+		Mode &= ~ENABLE_VIRTUAL_TERMINAL_INPUT;
+
+		if (BaseIsMouseTrackingEnabled()) {
+			Mode |= ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS;
+			Mode &= ~ENABLE_QUICK_EDIT_MODE;
+		}
 	}
 
 	Success = SetConsoleMode(ConsoleHandle, Mode);
@@ -144,6 +206,7 @@ KXBASEAPI BOOL WINAPI Ext_SetConsoleMode(
 KXBASEAPI BOOL WINAPI Ext_FreeConsole(
 	VOID)
 {
+	BaseDisableConsoleMouseInput();
 	BaseDisableConsoleAnsiSupport(GetStdHandle(STD_OUTPUT_HANDLE));
 	return FreeConsole();
 }
@@ -292,4 +355,36 @@ KXBASEAPI ULONG WINAPI Ext_GetConsoleOriginalTitleW(
 	FixGetConsoleTitleAorW(ConsoleTitle, BufferCch, sizeof(*ConsoleTitle), ReturnLength);
 
 	return ReturnLength;
+}
+
+KXBASEAPI HRESULT WINAPI Ext_CreatePseudoConsole(
+	IN	COORD	Size,
+	IN	HANDLE	InputHandle,
+	IN	HANDLE	OutputHandle,
+	IN	ULONG	Flags,
+	OUT	HPCON	*PseudoConsole)
+{
+	UNREFERENCED_PARAMETER(Size);
+	UNREFERENCED_PARAMETER(InputHandle);
+	UNREFERENCED_PARAMETER(OutputHandle);
+	UNREFERENCED_PARAMETER(Flags);
+	UNREFERENCED_PARAMETER(PseudoConsole);
+
+	return E_NOTIMPL;
+}
+
+KXBASEAPI HRESULT WINAPI Ext_ResizePseudoConsole(
+	IN	HPCON	PseudoConsole,
+	IN	COORD	Size)
+{
+	UNREFERENCED_PARAMETER(PseudoConsole);
+	UNREFERENCED_PARAMETER(Size);
+
+	return E_NOTIMPL;
+}
+
+KXBASEAPI VOID WINAPI Ext_ClosePseudoConsole(
+	IN	HPCON	PseudoConsole)
+{
+	UNREFERENCED_PARAMETER(PseudoConsole);
 }

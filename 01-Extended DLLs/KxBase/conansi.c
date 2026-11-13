@@ -33,12 +33,51 @@
 #define MAX_CSI_PARAMETER_COUNT		16
 
 //
+// Mouse support.
+//
+// Windows console applications receive MOUSE_EVENT input records, while
+// virtual terminal applications expect xterm mouse reports to arrive as
+// characters on the input stream. Windows 7 supports neither virtual terminal
+// input nor virtual terminal mouse reporting, so when an application enables
+// a mouse tracking mode we turn on ENABLE_MOUSE_INPUT behind its back and
+// translate MOUSE_EVENT records into escape sequences when input is read.
+//
+
+#define MOUSE_TRACKING_OFF			0
+#define MOUSE_TRACKING_X10			9
+#define MOUSE_TRACKING_NORMAL		1000
+#define MOUSE_TRACKING_BUTTON		1002
+#define MOUSE_TRACKING_ANY			1003
+
+#define MOUSE_ENCODING_X10			9
+#define MOUSE_ENCODING_UTF8			1005
+#define MOUSE_ENCODING_SGR			1006
+#define MOUSE_ENCODING_URXVT		1015
+
+//
 // Global variables for ANSI escape sequence support.
 //
 
 STATIC ULONG g_ConsoleANSISupport = 0; // VXKEX_CONSOLE_*
 STATIC COORD g_SavedCursorPosition; // 1-based, viewport-relative.
 STATIC WORD g_DefaultTextAttributes;
+STATIC BOOLEAN g_CsiPrivateMarker; // set when the CSI sequence starts with '?'
+
+//
+// Global variables for mouse support.
+//
+
+STATIC ULONG g_MouseTrackingMode; // MOUSE_TRACKING_*; 0 means disabled.
+STATIC ULONG g_MouseEncoding = MOUSE_ENCODING_X10;
+STATIC DWORD g_MouseButtonState; // button state at the previous mouse event.
+STATIC COORD g_MousePosition = { -1, -1 };
+STATIC BOOLEAN g_MouseInputEnabled; // did we turn on ENABLE_MOUSE_INPUT?
+STATIC BOOLEAN g_MouseQuickEditWasEnabled;
+STATIC WCHAR g_InputPending[64]; // translated mouse report not fully consumed.
+STATIC ULONG g_InputPendingCch;
+
+STATIC VOID RefreshConsolePalette(
+	IN	HANDLE	ConsoleHandle);
 
 BOOL IsConsoleHandle(
 	IN	HANDLE	Handle)
@@ -65,7 +104,11 @@ BOOLEAN BaseEnableConsoleAnsiSupport(
 	ASSERT (Success);
 
 	if (!Success) {
-		return Success;
+		// Don't give up on ANSI support just because the cursor position
+		// query failed. Some console handles are unusual, and a usable
+		// default is better than passing escape sequences through raw.
+		g_SavedCursorPosition.X = 1;
+		g_SavedCursorPosition.Y = 1;
 	}
 
 	//
@@ -82,18 +125,23 @@ BOOLEAN BaseEnableConsoleAnsiSupport(
 	Success = GetConsoleTextAttribute(ConsoleHandle, &g_DefaultTextAttributes);
 	ASSERT (Success);
 
+	if (!Success) {
+		g_DefaultTextAttributes =
+			FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE;
+	}
+
 	// Remove reverse video attribute if it happens to be set.
 	// It's very unlikely, but if it were, then SGR 0 would end up enabling
 	// reverse video, which is unwanted.
 	g_DefaultTextAttributes &= ~COMMON_LVB_REVERSE_VIDEO;
 
-	if (!Success) {
-		return Success;
-	}
+	// Use the palette the console actually renders with, so that 256-colour
+	// and 24-bit colour sequences are approximated against real colours.
+	RefreshConsolePalette(ConsoleHandle);
 
 	g_ConsoleANSISupport |= VXKEX_CONSOLE_ANSI_OUTPUT;
 	KexLogDebugEvent(L"Enabled escape sequence processing");
-	return Success;
+	return TRUE;
 }
 
 BOOLEAN BaseDisableConsoleAnsiSupport(
@@ -102,6 +150,451 @@ BOOLEAN BaseDisableConsoleAnsiSupport(
 	g_ConsoleANSISupport &= ~VXKEX_CONSOLE_ANSI_OUTPUT;
 	KexLogDebugEvent(L"Disabled escape sequence processing");
 	return TRUE;
+}
+
+BOOLEAN BaseIsMouseTrackingEnabled(
+	VOID)
+{
+	return (g_MouseTrackingMode != 0);
+}
+
+BOOLEAN BaseIsConsoleInputTranslationNeeded(
+	VOID)
+{
+	return (g_MouseTrackingMode != 0) || (g_InputPendingCch != 0);
+}
+
+STATIC VOID UpdateConsoleMouseInputMode(
+	VOID)
+{
+	HANDLE InputHandle;
+	DWORD Mode;
+
+	InputHandle = GetStdHandle(STD_INPUT_HANDLE);
+
+	if (!IsConsoleInputHandle(InputHandle)) {
+		return;
+	}
+
+	if (!GetConsoleMode(InputHandle, &Mode)) {
+		return;
+	}
+
+	if (g_MouseTrackingMode != 0) {
+		if (Mode & ENABLE_MOUSE_INPUT) {
+			// The application enabled mouse input by itself.
+			return;
+		}
+
+		Mode |= ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS;
+
+		//
+		// QuickEdit would turn mouse clicks into text selection instead of
+		// reporting them to the application, so it has to be turned off while
+		// mouse reporting is active.
+		//
+
+		if (Mode & ENABLE_QUICK_EDIT_MODE) {
+			Mode &= ~ENABLE_QUICK_EDIT_MODE;
+			g_MouseQuickEditWasEnabled = TRUE;
+		}
+
+		if (SetConsoleMode(InputHandle, Mode)) {
+			g_MouseInputEnabled = TRUE;
+		}
+	} else if (g_MouseInputEnabled) {
+		Mode &= ~ENABLE_MOUSE_INPUT;
+
+		if (g_MouseQuickEditWasEnabled) {
+			Mode |= ENABLE_QUICK_EDIT_MODE | ENABLE_EXTENDED_FLAGS;
+			g_MouseQuickEditWasEnabled = FALSE;
+		}
+
+		SetConsoleMode(InputHandle, Mode);
+		g_MouseInputEnabled = FALSE;
+	}
+}
+
+VOID BaseDisableConsoleMouseInput(
+	VOID)
+{
+	g_MouseTrackingMode = MOUSE_TRACKING_OFF;
+	g_MouseButtonState = 0;
+	g_InputPendingCch = 0;
+
+	UpdateConsoleMouseInputMode();
+}
+
+STATIC ULONG AppendDecimalNumber(
+	OUT	PWCHAR	Buffer,
+	IN	ULONG	BufferCch,
+	IN	ULONG	Number)
+{
+	WCHAR Digits[10];
+	ULONG DigitCount;
+	ULONG TotalCch;
+
+	DigitCount = 0;
+
+	do {
+		Digits[DigitCount++] = (WCHAR) (L'0' + (Number % 10));
+		Number /= 10;
+	} until (Number == 0);
+
+	TotalCch = DigitCount;
+
+	while (DigitCount != 0 && BufferCch != 0) {
+		*Buffer++ = Digits[--DigitCount];
+		--BufferCch;
+	}
+
+	return TotalCch;
+}
+
+STATIC ULONG MouseButtonFromState(
+	IN	DWORD	ButtonState)
+{
+	if (ButtonState & FROM_LEFT_1ST_BUTTON_PRESSED) {
+		return 0;
+	} else if (ButtonState & FROM_LEFT_2ND_BUTTON_PRESSED) {
+		return 1;
+	} else if (ButtonState & RIGHTMOST_BUTTON_PRESSED) {
+		return 2;
+	} else if (ButtonState & FROM_LEFT_3RD_BUTTON_PRESSED) {
+		return 6;
+	} else if (ButtonState & FROM_LEFT_4TH_BUTTON_PRESSED) {
+		return 7;
+	}
+
+	return 0;
+}
+
+BOOLEAN BaseTranslateMouseEvent(
+	IN	PMOUSE_EVENT_RECORD	MouseEvent,
+	OUT	PWCHAR				Buffer,
+	IN	ULONG				BufferCch,
+	OUT	PULONG				CchOut)
+{
+	DWORD ButtonState;
+	DWORD Released;
+	ULONG Button;
+	ULONG LegacyButton;
+	ULONG Modifier;
+	ULONG X;
+	ULONG Y;
+	ULONG Cch;
+	BOOLEAN IsRelease;
+	BOOLEAN IsMotion;
+
+	*CchOut = 0;
+
+	if (g_MouseTrackingMode == MOUSE_TRACKING_OFF) {
+		return FALSE;
+	}
+
+	// A single report is never longer than 24 characters.
+	if (BufferCch < 24) {
+		return FALSE;
+	}
+
+	IsRelease = FALSE;
+	IsMotion = (MouseEvent->dwEventFlags == MOUSE_MOVED);
+	Button = 0;
+
+	ButtonState = MouseEvent->dwButtonState & (
+		FROM_LEFT_1ST_BUTTON_PRESSED |
+		FROM_LEFT_2ND_BUTTON_PRESSED |
+		FROM_LEFT_3RD_BUTTON_PRESSED |
+		FROM_LEFT_4TH_BUTTON_PRESSED |
+		RIGHTMOST_BUTTON_PRESSED);
+
+	if (MouseEvent->dwEventFlags & MOUSE_WHEELED) {
+		SHORT Delta;
+
+		Delta = (SHORT) HIWORD(MouseEvent->dwButtonState);
+		Button = (Delta > 0) ? 64 : 65;
+	} else if (MouseEvent->dwEventFlags & MOUSE_HWHEELED) {
+		SHORT Delta;
+
+		Delta = (SHORT) HIWORD(MouseEvent->dwButtonState);
+		Button = (Delta > 0) ? 67 : 66;
+	} else {
+		Released = g_MouseButtonState & ~ButtonState;
+		g_MouseButtonState = ButtonState;
+
+		if (Released != 0) {
+			Button = MouseButtonFromState(Released);
+			IsRelease = TRUE;
+		} else {
+			Button = MouseButtonFromState(ButtonState);
+
+			if (IsMotion) {
+				if (g_MouseTrackingMode == MOUSE_TRACKING_X10 ||
+					g_MouseTrackingMode == MOUSE_TRACKING_NORMAL) {
+
+					return FALSE;
+				}
+
+				if (g_MouseTrackingMode == MOUSE_TRACKING_BUTTON &&
+					ButtonState == 0) {
+
+					return FALSE;
+				}
+
+				// Motion reports are marked by setting bit 5.
+				Button |= 32;
+			}
+		}
+	}
+
+	if (IsMotion &&
+		g_MousePosition.X == MouseEvent->dwMousePosition.X &&
+		g_MousePosition.Y == MouseEvent->dwMousePosition.Y) {
+
+		return FALSE;
+	}
+
+	g_MousePosition = MouseEvent->dwMousePosition;
+
+	Modifier = 0;
+
+	if (MouseEvent->dwControlKeyState & SHIFT_PRESSED) {
+		Modifier |= 4;
+	}
+
+	if (MouseEvent->dwControlKeyState & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED)) {
+		Modifier |= 8;
+	}
+
+	if (MouseEvent->dwControlKeyState & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED)) {
+		Modifier |= 16;
+	}
+
+	Button += Modifier;
+
+	X = (ULONG) max(MouseEvent->dwMousePosition.X + 1, 1);
+	Y = (ULONG) max(MouseEvent->dwMousePosition.Y + 1, 1);
+
+	// X10 and urxvt report releases as button 3.
+	LegacyButton = IsRelease ? 3 : Button;
+
+	Cch = 0;
+	Buffer[Cch++] = ESC;
+
+	switch (g_MouseEncoding) {
+	case MOUSE_ENCODING_SGR:
+		Buffer[Cch++] = '[';
+		Buffer[Cch++] = '<';
+		Cch += AppendDecimalNumber(&Buffer[Cch], BufferCch - Cch, Button);
+		Buffer[Cch++] = ';';
+		Cch += AppendDecimalNumber(&Buffer[Cch], BufferCch - Cch, X);
+		Buffer[Cch++] = ';';
+		Cch += AppendDecimalNumber(&Buffer[Cch], BufferCch - Cch, Y);
+		Buffer[Cch++] = IsRelease ? 'm' : 'M';
+		break;
+	case MOUSE_ENCODING_URXVT:
+		Buffer[Cch++] = '[';
+		Cch += AppendDecimalNumber(&Buffer[Cch], BufferCch - Cch, LegacyButton);
+		Buffer[Cch++] = ';';
+		Cch += AppendDecimalNumber(&Buffer[Cch], BufferCch - Cch, X);
+		Buffer[Cch++] = ';';
+		Cch += AppendDecimalNumber(&Buffer[Cch], BufferCch - Cch, Y);
+		Buffer[Cch++] = 'M';
+		break;
+	default:
+		//
+		// X10 encoding. Note that MOUSE_ENCODING_UTF8 is handled the same
+		// way: console input is converted through the console code page, so
+		// only 7-bit ASCII can be delivered reliably.
+		//
+
+		if (X > 223) {
+			X = 223;
+		}
+
+		if (Y > 223) {
+			Y = 223;
+		}
+
+		Buffer[Cch++] = '[';
+		Buffer[Cch++] = 'M';
+		Buffer[Cch++] = (WCHAR) (32 + LegacyButton);
+		Buffer[Cch++] = (WCHAR) (32 + X);
+		Buffer[Cch++] = (WCHAR) (32 + Y);
+		break;
+	}
+
+	*CchOut = Cch;
+	return TRUE;
+}
+
+STATIC VOID BuildSyntheticKeyEvent(
+	OUT	PINPUT_RECORD	Record,
+	IN	WCHAR			Character,
+	IN	BOOLEAN			Unicode)
+{
+	RtlZeroMemory(Record, sizeof(*Record));
+
+	Record->EventType = KEY_EVENT;
+	Record->Event.KeyEvent.bKeyDown = TRUE;
+	Record->Event.KeyEvent.wRepeatCount = 1;
+
+	if (Unicode) {
+		Record->Event.KeyEvent.uChar.UnicodeChar = Character;
+	} else {
+		Record->Event.KeyEvent.uChar.AsciiChar = (CHAR) Character;
+	}
+}
+
+STATIC BOOL ReadConsoleInputWithMouseAorW(
+	IN	HANDLE			ConsoleHandle,
+	OUT	PINPUT_RECORD	Buffer,
+	IN	ULONG			Length,
+	OUT	PULONG			NumberEventsRead,
+	IN	BOOLEAN			Unicode)
+{
+	INPUT_RECORD Record;
+	ULONG LocalNumberEventsRead;
+	ULONG RecordsRead;
+	ULONG Produced;
+	ULONG CchTranslated;
+	ULONG Index;
+	DWORD Available;
+	BOOL Success;
+
+	if (!NumberEventsRead) {
+		NumberEventsRead = &LocalNumberEventsRead;
+	}
+
+	*NumberEventsRead = 0;
+
+	if (!BaseIsConsoleInputTranslationNeeded() ||
+		!IsConsoleInputHandle(ConsoleHandle)) {
+
+		if (Unicode) {
+			return ReadConsoleInputW(
+				ConsoleHandle,
+				Buffer,
+				Length,
+				NumberEventsRead);
+		} else {
+			return ReadConsoleInputA(
+				ConsoleHandle,
+				Buffer,
+				Length,
+				NumberEventsRead);
+		}
+	}
+
+	Produced = 0;
+
+	while (Produced < Length) {
+		//
+		// Hand out characters left over from a previously translated mouse
+		// event before reading anything else.
+		//
+
+		while (g_InputPendingCch != 0 && Produced < Length) {
+			BuildSyntheticKeyEvent(
+				&Buffer[Produced],
+				g_InputPending[0],
+				Unicode);
+
+			++Produced;
+
+			for (Index = 1; Index < g_InputPendingCch; ++Index) {
+				g_InputPending[Index - 1] = g_InputPending[Index];
+			}
+
+			--g_InputPendingCch;
+		}
+
+		if (Produced == Length) {
+			break;
+		}
+
+		//
+		// Do not block for more input if we already have something to return,
+		// but do consume records which are already available.
+		//
+
+		if (Produced != 0) {
+			if (!GetNumberOfConsoleInputEvents(ConsoleHandle, &Available) ||
+				Available == 0) {
+
+				break;
+			}
+		}
+
+		if (Unicode) {
+			Success = ReadConsoleInputW(
+				ConsoleHandle,
+				&Record,
+				1,
+				&RecordsRead);
+		} else {
+			Success = ReadConsoleInputA(
+				ConsoleHandle,
+				&Record,
+				1,
+				&RecordsRead);
+		}
+
+		if (!Success) {
+			if (Produced != 0) {
+				break;
+			}
+
+			return FALSE;
+		}
+
+		if (RecordsRead == 0) {
+			break;
+		}
+
+		if (Record.EventType == MOUSE_EVENT && BaseIsMouseTrackingEnabled()) {
+			BaseTranslateMouseEvent(
+				&Record.Event.MouseEvent,
+				g_InputPending,
+				ARRAYSIZE(g_InputPending),
+				&CchTranslated);
+
+			continue;
+		}
+
+		Buffer[Produced++] = Record;
+	}
+
+	*NumberEventsRead = Produced;
+	return TRUE;
+}
+
+KXBASEAPI BOOL WINAPI Ext_ReadConsoleInputA(
+	IN	HANDLE			ConsoleHandle,
+	OUT	PINPUT_RECORD	Buffer,
+	IN	ULONG			Length,
+	OUT	PULONG			NumberEventsRead)
+{
+	return ReadConsoleInputWithMouseAorW(
+		ConsoleHandle,
+		Buffer,
+		Length,
+		NumberEventsRead,
+		FALSE);
+}
+
+KXBASEAPI BOOL WINAPI Ext_ReadConsoleInputW(
+	IN	HANDLE			ConsoleHandle,
+	OUT	PINPUT_RECORD	Buffer,
+	IN	ULONG			Length,
+	OUT	PULONG			NumberEventsRead)
+{
+	return ReadConsoleInputWithMouseAorW(
+		ConsoleHandle,
+		Buffer,
+		Length,
+		NumberEventsRead,
+		TRUE);
 }
 
 STATIC ULONG ParseNumber(
@@ -167,6 +660,157 @@ STATIC ULONG GetCchToNextEscapeOrEndOfBufferAorW(
 
 	// If we get here it means that there's no escape sequence
 	return Index;
+}
+
+STATIC BYTE g_ConsolePalette[16][3] = {
+	{   0,   0,   0 }, // Black
+	{   0,   0, 128 }, // Dark blue
+	{   0, 128,   0 }, // Dark green
+	{   0, 128, 128 }, // Dark cyan
+	{ 128,   0,   0 }, // Dark red
+	{ 128,   0, 128 }, // Dark magenta
+	{ 128, 128,   0 }, // Dark yellow
+	{ 192, 192, 192 }, // Gray
+	{ 128, 128, 128 }, // Dark gray
+	{   0,   0, 255 }, // Blue
+	{   0, 255,   0 }, // Green
+	{   0, 255, 255 }, // Cyan
+	{ 255,   0,   0 }, // Red
+	{ 255,   0, 255 }, // Magenta
+	{ 255, 255,   0 }, // Yellow
+	{ 255, 255, 255 }  // White
+};
+
+//
+// Fetch the colours which the console actually uses. This matters because the
+// console palette can be customised (e.g. by the user or by a colour scheme),
+// and approximating a 256-colour or 24-bit colour against the built-in palette
+// would then produce visibly wrong results.
+//
+STATIC VOID RefreshConsolePalette(
+	IN	HANDLE	ConsoleHandle)
+{
+	CONSOLE_SCREEN_BUFFER_INFOEX Sbi;
+	ULONG Index;
+	COLORREF Color;
+
+	RtlZeroMemory(&Sbi, sizeof(Sbi));
+	Sbi.cbSize = sizeof(Sbi);
+
+	if (!GetConsoleScreenBufferInfoEx(ConsoleHandle, &Sbi)) {
+		return;
+	}
+
+	for (Index = 0; Index < ARRAYSIZE(Sbi.ColorTable); ++Index) {
+		Color = Sbi.ColorTable[Index];
+
+		g_ConsolePalette[Index][0] = (BYTE) (Color & 0xFF);
+		g_ConsolePalette[Index][1] = (BYTE) ((Color >> 8) & 0xFF);
+		g_ConsolePalette[Index][2] = (BYTE) ((Color >> 16) & 0xFF);
+	}
+}
+
+STATIC WORD ConsoleColorFromRGB(
+	IN	BYTE	Red,
+	IN	BYTE	Green,
+	IN	BYTE	Blue,
+	IN	BOOLEAN	Background)
+{
+	ULONG Index;
+	ULONG BestIndex;
+	ULONG BestDistance;
+	WORD Attribute;
+
+	BestIndex = 0;
+	BestDistance = (ULONG) -1;
+
+	for (Index = 0; Index < ARRAYSIZE(g_ConsolePalette); ++Index) {
+		LONG RedDelta;
+		LONG GreenDelta;
+		LONG BlueDelta;
+		ULONG Distance;
+
+		RedDelta = (LONG) Red - g_ConsolePalette[Index][0];
+		GreenDelta = (LONG) Green - g_ConsolePalette[Index][1];
+		BlueDelta = (LONG) Blue - g_ConsolePalette[Index][2];
+
+		Distance = (ULONG) (
+			RedDelta * RedDelta +
+			GreenDelta * GreenDelta +
+			BlueDelta * BlueDelta);
+
+		if (Distance < BestDistance) {
+			BestDistance = Distance;
+			BestIndex = Index;
+		}
+	}
+
+	if (Background) {
+		Attribute = (WORD) ((BestIndex & 0x7) << 4);
+
+		if (BestIndex & 0x8) {
+			Attribute |= BACKGROUND_INTENSITY;
+		}
+	} else {
+		Attribute = (WORD) (BestIndex & 0x7);
+
+		if (BestIndex & 0x8) {
+			Attribute |= FOREGROUND_INTENSITY;
+		}
+	}
+
+	return Attribute;
+}
+
+STATIC VOID XtermColorToRGB(
+	IN	ULONG	Color,
+	OUT	PBYTE	Red,
+	OUT	PBYTE	Green,
+	OUT	PBYTE	Blue)
+{
+	STATIC CONST BYTE Levels[6] = { 0, 95, 135, 175, 215, 255 };
+
+	if (Color < 16) {
+		*Red = g_ConsolePalette[Color][0];
+		*Green = g_ConsolePalette[Color][1];
+		*Blue = g_ConsolePalette[Color][2];
+	} else if (Color < 232) {
+		ULONG Index;
+
+		Index = Color - 16;
+
+		*Red = Levels[(Index / 36) % 6];
+		*Green = Levels[(Index / 6) % 6];
+		*Blue = Levels[Index % 6];
+	} else {
+		BYTE Gray;
+
+		Gray = (BYTE) (8 + (Color - 232) * 10);
+
+		*Red = Gray;
+		*Green = Gray;
+		*Blue = Gray;
+	}
+}
+
+STATIC WORD ApplyConsoleColor(
+	IN	WORD	TextAttribute,
+	IN	WORD	ColorAttribute,
+	IN	BOOLEAN	Background)
+{
+	if (Background) {
+		TextAttribute &= ~(BACKGROUND_INTENSITY |
+						   BACKGROUND_RED |
+						   BACKGROUND_GREEN |
+						   BACKGROUND_BLUE);
+	} else {
+		TextAttribute &= ~(FOREGROUND_INTENSITY |
+						   FOREGROUND_RED |
+						   FOREGROUND_GREEN |
+						   FOREGROUND_BLUE);
+	}
+
+	return TextAttribute | ColorAttribute;
 }
 
 STATIC BOOLEAN ExecuteCSISetGraphicsRendition(
@@ -238,6 +882,15 @@ STATIC BOOLEAN ExecuteCSISetGraphicsRendition(
 		case 1:		// Bright
 			TextAttribute |= FOREGROUND_INTENSITY;
 			break;
+		case 2:		// Faint
+			// The console has no dim attribute. Dropping the intensity bit is
+			// closer to what the application asked for than ignoring the
+			// sequence altogether.
+			TextAttribute &= ~FOREGROUND_INTENSITY;
+			break;
+		case 4:		// Underline
+			TextAttribute |= COMMON_LVB_UNDERSCORE;
+			break;
 		case 7:		// Reverse video (negative)
 			// This flag has no effect on the console but we just use it to remember
 			// the fact that reverse video is enabled
@@ -249,8 +902,15 @@ STATIC BOOLEAN ExecuteCSISetGraphicsRendition(
 			TextAttribute &= ~COMMON_LVB_REVERSE_VIDEO;
 			*(PBYTE) &TextAttribute = _rotl8((BYTE) TextAttribute, 4);
 			break;
+		case 21:	// Double underline
+			TextAttribute &= ~FOREGROUND_INTENSITY;
+			TextAttribute |= COMMON_LVB_UNDERSCORE;
+			break;
 		case 22:	// No bright
 			TextAttribute &= ~FOREGROUND_INTENSITY;
+			break;
+		case 24:	// Underline off
+			TextAttribute &= ~COMMON_LVB_UNDERSCORE;
 			break;
 		case 31:	// Red
 			TextAttribute |= FOREGROUND_RED;
@@ -308,15 +968,81 @@ STATIC BOOLEAN ExecuteCSISetGraphicsRendition(
 			break;
 		case 38:	// Extended foreground color setting
 		case 48:	// Extended background color setting
-			// We don't support extended fg/bg color setting.
-			// These come with additional parameters which will cause
-			// random color changes if we were to interpret them as normal
-			// SGR parameters, so we'll just ignore the rest of the SGR escape.
+		{
+			BOOLEAN Background;
+			ULONG ColorModeIndex;
+			SHORT ColorMode;
+
+			Background = (Parameter == 48);
+			ColorModeIndex = ParameterIndex + 1;
+
+			if (ColorModeIndex < ParameterCount) {
+				ColorMode = CsiParameters[ColorModeIndex];
+			} else {
+				ColorMode = -1;
+			}
+
+			if (ColorMode == 5 && ColorModeIndex + 1 < ParameterCount) {
+				BYTE Red;
+				BYTE Green;
+				BYTE Blue;
+				WORD ColorAttribute;
+
+				XtermColorToRGB(
+					(ULONG) (USHORT) CsiParameters[ColorModeIndex + 1],
+					&Red,
+					&Green,
+					&Blue);
+
+				ColorAttribute = ConsoleColorFromRGB(
+					Red,
+					Green,
+					Blue,
+					Background);
+
+				TextAttribute = ApplyConsoleColor(
+					TextAttribute,
+					ColorAttribute,
+					Background);
+
+				ParameterIndex = ColorModeIndex + 1;
+				break;
+			}
+
+			if (ColorMode == 2 && ColorModeIndex + 3 < ParameterCount) {
+				BYTE Red;
+				BYTE Green;
+				BYTE Blue;
+				WORD ColorAttribute;
+
+				Red = (BYTE) (USHORT) CsiParameters[ColorModeIndex + 1];
+				Green = (BYTE) (USHORT) CsiParameters[ColorModeIndex + 2];
+				Blue = (BYTE) (USHORT) CsiParameters[ColorModeIndex + 3];
+
+				ColorAttribute = ConsoleColorFromRGB(
+					Red,
+					Green,
+					Blue,
+					Background);
+
+				TextAttribute = ApplyConsoleColor(
+					TextAttribute,
+					ColorAttribute,
+					Background);
+
+				ParameterIndex = ColorModeIndex + 3;
+				break;
+			}
+
+			// Malformed or unsupported extended color setting. Consume the
+			// rest of the SGR sequence instead of interpreting its arguments
+			// as separate text attributes.
 			KexLogDebugEvent(
 				L"Extended %s color setting ignored",
-				Parameter == 38 ? L"foreground" : L"background");
+				Background ? L"background" : L"foreground");
 			KexDebugCheckpoint();
 			return FALSE;
+		}
 		}
 	}
 
@@ -471,8 +1197,152 @@ STATIC BOOLEAN ExecuteCSI(
 		}
 
 		break;
+	case 'h': // Set Mode
+	case 'l': // Reset Mode
+	{
+		ULONG ModeIndex;
+
+		if (!g_CsiPrivateMarker) {
+			// Only private (DEC) modes are supported. Regular ANSI modes
+			// such as insert/replace are meaningless on the Windows console.
+			return FALSE;
+		}
+
+		for (ModeIndex = 0; ModeIndex < ParameterCount; ++ModeIndex) {
+			switch (CsiParameters[ModeIndex]) {
+			case 25: { // Show Cursor (h) / Hide Cursor (l)
+				CONSOLE_CURSOR_INFO CursorInfo;
+
+				if (GetConsoleCursorInfo(ConsoleHandle, &CursorInfo)) {
+					CursorInfo.bVisible = (Command == 'h');
+					SetConsoleCursorInfo(ConsoleHandle, &CursorInfo);
+				}
+
+				break;
+			}
+			case 9:		// X10 mouse reporting
+			case 1000:	// Normal mouse tracking
+			case 1002:	// Button-event mouse tracking
+			case 1003:	// Any-event mouse tracking
+				if (Command == 'h') {
+					g_MouseTrackingMode = (ULONG) CsiParameters[ModeIndex];
+					g_MouseButtonState = 0;
+				} else if (g_MouseTrackingMode == (ULONG) CsiParameters[ModeIndex]) {
+					g_MouseTrackingMode = MOUSE_TRACKING_OFF;
+					g_MouseButtonState = 0;
+				}
+
+				UpdateConsoleMouseInputMode();
+				break;
+			case 1005:	// UTF-8 mouse coordinates
+			case 1006:	// SGR mouse reporting
+			case 1015:	// urxvt mouse reporting
+				if (Command == 'h') {
+					g_MouseEncoding = (ULONG) CsiParameters[ModeIndex];
+				} else if (g_MouseEncoding == (ULONG) CsiParameters[ModeIndex]) {
+					g_MouseEncoding = MOUSE_ENCODING_X10;
+				}
+
+				break;
+			case 1004: { // Focus event reporting
+				HANDLE InputHandle;
+
+				InputHandle = GetStdHandle(STD_INPUT_HANDLE);
+
+				if (IsConsoleInputHandle(InputHandle)) {
+					InjectStringToConsoleInput(
+						InputHandle,
+						(Command == 'h') ? L"\x1b[I" : L"\x1b[O");
+				}
+
+				break;
+			}
+			case 1049: { // Alternate Screen Buffer (approximated by a clear)
+				if (Command == 'h') {
+					CONSOLE_SCREEN_BUFFER_INFO Sbi;
+					COORD Origin = { 0, 0 };
+					DWORD CellCount;
+					DWORD CellsWritten;
+
+					if (GetConsoleScreenBufferInfo(ConsoleHandle, &Sbi)) {
+						CellCount = (DWORD) Sbi.dwSize.X * (DWORD) Sbi.dwSize.Y;
+
+						FillConsoleOutputCharacter(
+							ConsoleHandle,
+							' ',
+							CellCount,
+							Origin,
+							&CellsWritten);
+
+						FillConsoleOutputAttribute(
+							ConsoleHandle,
+							g_DefaultTextAttributes,
+							CellCount,
+							Origin,
+							&CellsWritten);
+
+						SetConsoleCursorPosition(ConsoleHandle, Origin);
+					}
+				}
+
+				break;
+			}
+			default:
+				// Bracketed paste, synchronized updates and other modes have no
+				// Windows console equivalent; ignore them.
+				break;
+			}
+		}
+
+		return TRUE;
+	}
 	case 'm': // Set Graphics Rendition (SGR)
 		return ExecuteCSISetGraphicsRendition(ConsoleHandle, CsiParameters, ParameterCount);
+	case 'n': // Device Status Report
+		if (CsiParameters[0] == 6) {
+			HANDLE InputHandle;
+			WCHAR Reply[16];
+			ULONG ReplyCch;
+			COORD Position;
+
+			InputHandle = GetStdHandle(STD_INPUT_HANDLE);
+
+			if (!VTGetCursorPosition(ConsoleHandle, &Position) ||
+				!IsConsoleInputHandle(InputHandle)) {
+
+				return FALSE;
+			}
+
+			// Reply with the 1-based cursor position, e.g. ESC [ 12 ; 40 R
+			ReplyCch = 0;
+			Reply[ReplyCch++] = ESC;
+			Reply[ReplyCch++] = '[';
+			ReplyCch += AppendDecimalNumber(
+				&Reply[ReplyCch],
+				ARRAYSIZE(Reply) - ReplyCch,
+				(ULONG) Position.Y);
+			Reply[ReplyCch++] = ';';
+			ReplyCch += AppendDecimalNumber(
+				&Reply[ReplyCch],
+				ARRAYSIZE(Reply) - ReplyCch,
+				(ULONG) Position.X);
+			Reply[ReplyCch++] = 'R';
+			Reply[ReplyCch] = '\0';
+
+			return InjectStringToConsoleInput(InputHandle, Reply);
+		} else if (CsiParameters[0] == 5) { // Operating Status Report
+			HANDLE InputHandle;
+
+			InputHandle = GetStdHandle(STD_INPUT_HANDLE);
+
+			if (!IsConsoleInputHandle(InputHandle)) {
+				return FALSE;
+			}
+
+			return InjectStringToConsoleInput(InputHandle, L"\x1b[0n");
+		}
+
+		return FALSE;
 	case 's': // Save Cursor (ANSI.SYS)
 		return VTGetCursorPosition(ConsoleHandle, &g_SavedCursorPosition);
 	case 'u': // Restore Cursor (ANSI.SYS)
@@ -601,6 +1471,9 @@ STATIC BOOLEAN ProcessEscapeSequenceAorW(
 
 		// final character determines command
 		Command = Csi[CsiLength - 1];
+
+		// remember whether this is a private (DEC) sequence such as "?25l"
+		g_CsiPrivateMarker = (Csi[0] == '?');
 
 		//
 		// Parse CSI sequence parameters
